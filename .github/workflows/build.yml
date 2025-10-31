@@ -1,0 +1,49 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout plugin repository
+      uses: actions/checkout@v4
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+    
+    - name: Checkout Strimzi (for SPI dependency)
+      uses: actions/checkout@v4
+      with:
+        repository: strimzi/strimzi-kafka-operator
+        ref: main
+        path: strimzi-kafka-operator
+    
+    - name: Install Strimzi SPI to local Maven repo
+      run: |
+        cd strimzi-kafka-operator
+        mvn clean install -pl cluster-operator -DskipTests -Dcheckstyle.skip=true -Dspotbugs.skip=true
+    
+    - name: Build MCS Plugin
+      run: mvn clean package
+    
+    - name: Verify JAR contents
+      run: |
+        echo "Checking JAR contents..."
+        jar tf target/strimzi-stretch-mcs-plugin-*.jar | grep McsNetworkingProvider
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcs-plugin-jar
+        path: target/strimzi-stretch-mcs-plugin-*.jar
+        retention-days: 7
