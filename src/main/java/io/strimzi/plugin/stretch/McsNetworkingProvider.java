@@ -4,12 +4,12 @@
  */
 package io.strimzi.plugin.stretch;
 
+import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
 import io.fabric8.kubernetes.api.model.HasMetadata;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.ServicePort;
-import io.strimzi.api.kafka.model.serviceexport.ServiceExport;
-import io.strimzi.api.kafka.model.serviceexport.ServiceExportBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
 import io.strimzi.operator.cluster.operator.resource.ResourceOperatorSupplier;
 import io.strimzi.operator.cluster.stretch.spi.StretchNetworkingProvider;
 import io.strimzi.operator.common.Reconciliation;
@@ -18,6 +18,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -67,6 +68,10 @@ public final class McsNetworkingProvider
     private final Set<String> createdServices = new HashSet<>();
     /** Track the current reconciliation to clear cache when reconciliation changes. */
     private String currentReconciliation = null;
+    /** Helper for ServiceExport operations in central cluster. */
+    private ServiceExportHelper serviceExportHelper;
+    /** Helpers for ServiceExport operations in remote clusters. */
+    private final Map<String, ServiceExportHelper> remoteServiceExportHelpers = new HashMap<>();
 
     @Override
     public Future<Void> init(
@@ -76,6 +81,25 @@ public final class McsNetworkingProvider
 
         this.centralSupplier = centralSupplierParam;
         this.remoteResourceOperatorSupplier = remoteResourceOperatorSupplierParam;
+
+        // Initialize ServiceExportHelper for central cluster
+        KubernetesClient centralClient = centralSupplier.getKubernetesClient();
+        this.serviceExportHelper = new ServiceExportHelper(centralClient);
+
+        // Note: We don't validate CRD installation at startup to avoid permission issues
+        // and timing problems. If ServiceExport CRD is missing, operations will fail
+        // with clear error messages when actually needed.
+        LOGGER.info("Initialized MCS networking provider - ServiceExport operations will be attempted as needed");
+
+        // Initialize helpers for remote clusters
+        for (Map.Entry<String, ResourceOperatorSupplier> entry :
+                remoteResourceOperatorSupplier.remoteResourceOperators.entrySet()) {
+            String clusterId = entry.getKey();
+            ResourceOperatorSupplier supplier = entry.getValue();
+            KubernetesClient remoteClient = supplier.getKubernetesClient();
+            remoteServiceExportHelpers.put(clusterId, new ServiceExportHelper(remoteClient));
+            LOGGER.debug("Initialized ServiceExportHelper for remote cluster: {}", clusterId);
+        }
 
         // Read configuration
         if (config != null) {
@@ -150,16 +174,17 @@ public final class McsNetworkingProvider
             
             // Check if ServiceExport already exists in the cluster
             // This is critical for recovery - if it's missing, we'll create it
-            io.strimzi.operator.cluster.operator.resource.kubernetes.ServiceExportOperator seOp = 
-                remoteResourceOperatorSupplier.serviceExportOperators.get(clusterId);
-            if (seOp != null) {
-                ServiceExport existingExport = seOp.get(namespace, serviceName);
-                if (existingExport != null) {
-                    LOGGER.debug("{}: ServiceExport {} already exists in cluster {}, skipping creation",
-                               reconciliation, serviceName, clusterId);
-                    createdServices.add(serviceKey);
-                    return Future.succeededFuture(new ArrayList<>());
-                }
+            ServiceExportHelper helper = remoteServiceExportHelpers.get(clusterId);
+            if (helper == null) {
+                helper = serviceExportHelper; // fallback to central
+            }
+
+            GenericKubernetesResource existingExport = helper.get(namespace, serviceName);
+            if (existingExport != null) {
+                LOGGER.debug("{}: ServiceExport {} already exists in cluster {}, skipping creation",
+                           reconciliation, serviceName, clusterId);
+                createdServices.add(serviceKey);
+                return Future.succeededFuture(new ArrayList<>());
             }
             
             LOGGER.info("{}: ServiceExport {} does not exist in cluster {}, will create it",
@@ -200,16 +225,22 @@ public final class McsNetworkingProvider
             .endSpec()
             .build();
 
+        // Get ServiceExportHelper for this cluster
+        ServiceExportHelper helper = remoteServiceExportHelpers.get(clusterId);
+        if (helper == null) {
+            helper = serviceExportHelper; // fallback to central
+        }
+
         // Create ServiceExport for this service
-        ServiceExport serviceExport = new ServiceExportBuilder()
-            .withNewMetadata()
-                .withName(serviceName)
-                .withNamespace(namespace)
-                .addToLabels("app", "strimzi")
-                .addToLabels("strimzi.io/cluster", clusterName)
-                .addToAnnotations("strimzi.io/stretch-cluster-id", clusterId)
-            .endMetadata()
-            .build();
+        Map<String, String> labels = new HashMap<>();
+        labels.put("app", "strimzi");
+        labels.put("strimzi.io/cluster", clusterName);
+
+        Map<String, String> annotations = new HashMap<>();
+        annotations.put("strimzi.io/stretch-cluster-id", clusterId);
+
+        GenericKubernetesResource serviceExport = helper.create(
+            serviceName, namespace, labels, annotations);
 
         List<HasMetadata> resources = new ArrayList<>();
 
@@ -233,31 +264,22 @@ public final class McsNetworkingProvider
         }
 
         // Create ServiceExport in ALL clusters (including central)
+        final ServiceExportHelper finalHelper = helper;
         return serviceFuture.compose(v -> {
-                // Get ServiceExportOperator for this cluster
-                io.strimzi.operator.cluster.operator.resource.kubernetes.ServiceExportOperator seOp = 
-                    remoteResourceOperatorSupplier.serviceExportOperators.get(clusterId);
-                if (seOp == null) {
-                    LOGGER.error("{}: ServiceExportOperator is NULL for cluster {}! Cannot create ServiceExport",
-                               reconciliation, clusterId);
-                    return Future.succeededFuture();
+                try {
+                    // Create ServiceExport in the cluster
+                    LOGGER.debug("{}: Creating ServiceExport {} in cluster {}",
+                               reconciliation, serviceName, clusterId);
+                    finalHelper.createOrReplace(serviceExport);
+                    resources.add(serviceExport);
+                    LOGGER.debug("{}: Created/updated ServiceExport {} in cluster {}",
+                               reconciliation, serviceName, clusterId);
+                    return Future.succeededFuture(resources);
+                } catch (Exception error) {
+                    LOGGER.error("{}: Failed to create ServiceExport {} in cluster {}: {}",
+                               reconciliation, serviceName, clusterId, error.getMessage(), error);
+                    return Future.succeededFuture(resources);
                 }
-
-                // Create ServiceExport in the cluster
-                LOGGER.debug("{}: Creating ServiceExport {} in cluster {}",
-                           reconciliation, serviceName, clusterId);
-                return seOp.reconcile(reconciliation, namespace, serviceName, serviceExport);
-            })
-            .map(exportResult -> {
-                resources.add(serviceExport);
-                LOGGER.debug("{}: Created/updated ServiceExport {} in cluster {}",
-                           reconciliation, serviceName, clusterId);
-                return resources;
-            })
-            .recover(error -> {
-                LOGGER.error("{}: Failed to create ServiceExport {} in cluster {}: {}",
-                           reconciliation, serviceName, clusterId, error.getMessage(), error);
-                return Future.succeededFuture(resources);
             });
     }
 
@@ -273,22 +295,21 @@ public final class McsNetworkingProvider
      *                        resources)
      * @return ServiceExport resource
      */
-    public ServiceExport createServiceExport(
+    public GenericKubernetesResource createServiceExport(
             final String serviceName,
             final String namespace,
             final Map<String, String> labels,
             final List<io.fabric8.kubernetes.api.model.OwnerReference>
                 ownerReferences) {
 
-        ServiceExportBuilder builder = new ServiceExportBuilder()
-            .withNewMetadata()
-                .withName(serviceName)
-                .withNamespace(namespace)
-                .withLabels(labels)
-                .withOwnerReferences(ownerReferences)
-            .endMetadata();
+        GenericKubernetesResource serviceExport = serviceExportHelper.create(
+            serviceName, namespace, labels, null);
 
-        return builder.build();
+        if (ownerReferences != null && !ownerReferences.isEmpty()) {
+            serviceExport.getMetadata().setOwnerReferences(ownerReferences);
+        }
+
+        return serviceExport;
     }
 
     @Override
@@ -545,15 +566,18 @@ public final class McsNetworkingProvider
                 reconciliation, serviceName, clusterId);
 
         // Delete ServiceExport first
-        io.strimzi.operator.cluster.operator.resource.kubernetes.ServiceExportOperator seOp = 
-            remoteResourceOperatorSupplier.centralServiceExportOperator;
-        return seOp.reconcile(reconciliation, namespace, serviceName, null)
-            .compose(v -> {
-                // Then delete Service
-                return centralSupplier.serviceOperations
-                    .reconcile(reconciliation, namespace, serviceName,
-                            null);
-            })
+        try {
+            serviceExportHelper.delete(namespace, serviceName);
+            LOGGER.debug("{}: Deleted ServiceExport {} in cluster {}",
+                       reconciliation, serviceName, clusterId);
+        } catch (Exception e) {
+            LOGGER.warn("{}: Failed to delete ServiceExport {}: {}",
+                       reconciliation, serviceName, e.getMessage());
+        }
+
+        // Then delete Service
+        return centralSupplier.serviceOperations
+            .reconcile(reconciliation, namespace, serviceName, null)
             .mapEmpty();
     }
 
