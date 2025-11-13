@@ -4,13 +4,19 @@
  */
 package io.strimzi.plugin.stretch;
 
+import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
 import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.OwnerReference;
+import io.fabric8.kubernetes.api.model.OwnerReferenceBuilder;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.ServicePort;
+import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.strimzi.api.kafka.model.kafka.Kafka;
 import io.strimzi.operator.cluster.operator.resource.ResourceOperatorSupplier;
+import io.strimzi.operator.cluster.stretch.RemoteResourceOperatorSupplier;
 import io.strimzi.operator.cluster.stretch.spi.StretchNetworkingProvider;
 import io.strimzi.operator.common.Reconciliation;
 import io.vertx.core.Future;
@@ -53,7 +59,7 @@ public final class McsNetworkingProvider
     /** Resource operator supplier for central cluster. */
     private ResourceOperatorSupplier centralSupplier;
     /** Resource operator supplier for remote clusters. */
-    private io.strimzi.operator.cluster.stretch.RemoteResourceOperatorSupplier remoteResourceOperatorSupplier;
+    private RemoteResourceOperatorSupplier remoteResourceOperatorSupplier;
     /** Clusterset domain for MCS DNS names. */
     private String clustersetDomain = "clusterset.local";
     /** Whether to require namespace sameness across clusters. */
@@ -71,7 +77,7 @@ public final class McsNetworkingProvider
     public Future<Void> init(
             final Map<String, String> config,
             final ResourceOperatorSupplier centralSupplierParam,
-            final io.strimzi.operator.cluster.stretch.RemoteResourceOperatorSupplier remoteResourceOperatorSupplierParam) {
+            final RemoteResourceOperatorSupplier remoteResourceOperatorSupplierParam) {
 
         this.centralSupplier = centralSupplierParam;
         this.remoteResourceOperatorSupplier = remoteResourceOperatorSupplierParam;
@@ -188,7 +194,7 @@ public final class McsNetworkingProvider
 
         List<ServicePort> servicePorts = ports.entrySet().stream()
             .map(entry -> {
-                return new io.fabric8.kubernetes.api.model.ServicePortBuilder()
+                return new ServicePortBuilder()
                     .withName(entry.getKey())
                     .withPort(entry.getValue())
                     .withProtocol("TCP")
@@ -240,15 +246,15 @@ public final class McsNetworkingProvider
         if (isCentralCluster) {
             // For central cluster, set Kafka CR as owner
             try {
-                io.fabric8.kubernetes.api.model.HasMetadata kafkaCr = supplier.getKubernetesClient()
-                    .resources(io.strimzi.api.kafka.model.kafka.Kafka.class)
+                HasMetadata kafkaCr = supplier.getKubernetesClient()
+                    .resources(Kafka.class)
                     .inNamespace(namespace)
                     .withName(clusterName)
                     .get();
                 
                 if (kafkaCr != null && kafkaCr.getMetadata().getUid() != null) {
-                    io.fabric8.kubernetes.api.model.OwnerReference kafkaOwner = 
-                        new io.fabric8.kubernetes.api.model.OwnerReferenceBuilder()
+                    OwnerReference kafkaOwner = 
+                        new OwnerReferenceBuilder()
                             .withApiVersion("kafka.strimzi.io/v1beta2")
                             .withKind("Kafka")
                             .withName(clusterName)
@@ -257,7 +263,7 @@ public final class McsNetworkingProvider
                             .withBlockOwnerDeletion(false)
                             .build();
                     
-                    List<io.fabric8.kubernetes.api.model.OwnerReference> owners = new ArrayList<>();
+                    List<OwnerReference> owners = new ArrayList<>();
                     owners.add(kafkaOwner);
                     serviceExport.getMetadata().setOwnerReferences(owners);
                     
@@ -276,7 +282,7 @@ public final class McsNetworkingProvider
             String gcConfigMapName = clusterName + "-kafka-gc";
             
             // Fetch the GC ConfigMap to get its UID
-            io.fabric8.kubernetes.api.model.ConfigMap gcConfigMap = null;
+            ConfigMap gcConfigMap = null;
             try {
                 gcConfigMap = supplier.configMapOperations.get(namespace, gcConfigMapName);
             } catch (Exception e) {
@@ -287,8 +293,8 @@ public final class McsNetworkingProvider
             if (gcConfigMap != null && gcConfigMap.getMetadata().getUid() != null) {
                 String gcUid = gcConfigMap.getMetadata().getUid();
                 
-                io.fabric8.kubernetes.api.model.OwnerReference gcOwner = 
-                    new io.fabric8.kubernetes.api.model.OwnerReferenceBuilder()
+                OwnerReference gcOwner = 
+                    new OwnerReferenceBuilder()
                         .withApiVersion("v1")
                         .withKind("ConfigMap")
                         .withName(gcConfigMapName)
@@ -297,7 +303,7 @@ public final class McsNetworkingProvider
                         .withBlockOwnerDeletion(false)
                         .build();
                 
-                List<io.fabric8.kubernetes.api.model.OwnerReference> owners = new ArrayList<>();
+                List<OwnerReference> owners = new ArrayList<>();
                 owners.add(gcOwner);
                 serviceExport.getMetadata().setOwnerReferences(owners);
                 
@@ -366,8 +372,7 @@ public final class McsNetworkingProvider
             final String serviceName,
             final String namespace,
             final Map<String, String> labels,
-            final List<io.fabric8.kubernetes.api.model.OwnerReference>
-                ownerReferences) {
+            final List<OwnerReference> ownerReferences) {
 
         GenericKubernetesResource serviceExport = serviceExportHelper.create(
             serviceName, namespace, labels, null);
