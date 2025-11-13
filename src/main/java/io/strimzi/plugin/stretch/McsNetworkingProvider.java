@@ -45,15 +45,9 @@ public final class McsNetworkingProvider
     private static final Logger LOGGER =
             LogManager.getLogger(McsNetworkingProvider.class);
 
-    /** Standard Kafka replication port. */
+    /** Standard Kafka replication port (internal, always 9091). */
     private static final int PORT_REPLICATION = 9091;
-    /** Standard Kafka plain port. */
-    private static final int PORT_PLAIN = 9092;
-    /** Standard Kafka TLS port. */
-    private static final int PORT_TLS = 9093;
-    /** Standard Kafka external port. */
-    private static final int PORT_EXTERNAL = 9094;
-    /** Standard Kafka control plane port. */
+    /** Standard Kafka control plane port (internal, always 9090). */
     private static final int PORT_CONTROL_PLANE = 9090;
 
     /** Resource operator supplier for central cluster. */
@@ -242,6 +236,79 @@ public final class McsNetworkingProvider
         GenericKubernetesResource serviceExport = helper.create(
             serviceName, namespace, labels, annotations);
 
+        // Set owner reference based on cluster type
+        if (isCentralCluster) {
+            // For central cluster, set Kafka CR as owner
+            try {
+                io.fabric8.kubernetes.api.model.HasMetadata kafkaCr = supplier.getKubernetesClient()
+                    .resources(io.strimzi.api.kafka.model.kafka.Kafka.class)
+                    .inNamespace(namespace)
+                    .withName(clusterName)
+                    .get();
+                
+                if (kafkaCr != null && kafkaCr.getMetadata().getUid() != null) {
+                    io.fabric8.kubernetes.api.model.OwnerReference kafkaOwner = 
+                        new io.fabric8.kubernetes.api.model.OwnerReferenceBuilder()
+                            .withApiVersion("kafka.strimzi.io/v1beta2")
+                            .withKind("Kafka")
+                            .withName(clusterName)
+                            .withUid(kafkaCr.getMetadata().getUid())
+                            .withController(false)
+                            .withBlockOwnerDeletion(false)
+                            .build();
+                    
+                    List<io.fabric8.kubernetes.api.model.OwnerReference> owners = new ArrayList<>();
+                    owners.add(kafkaOwner);
+                    serviceExport.getMetadata().setOwnerReferences(owners);
+                    
+                    LOGGER.debug("{}: Added Kafka CR {} (UID: {}) as owner for ServiceExport {} in central cluster",
+                               reconciliation, clusterName, kafkaCr.getMetadata().getUid(), serviceName);
+                } else {
+                    LOGGER.warn("{}: Kafka CR {} not found or has no UID in central cluster, ServiceExport will not have owner reference",
+                               reconciliation, clusterName);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("{}: Failed to fetch Kafka CR {} in central cluster: {}",
+                           reconciliation, clusterName, e.getMessage());
+            }
+        } else {
+            // For remote clusters, set GC ConfigMap as owner
+            String gcConfigMapName = clusterName + "-kafka-gc";
+            
+            // Fetch the GC ConfigMap to get its UID
+            io.fabric8.kubernetes.api.model.ConfigMap gcConfigMap = null;
+            try {
+                gcConfigMap = supplier.configMapOperations.get(namespace, gcConfigMapName);
+            } catch (Exception e) {
+                LOGGER.warn("{}: Failed to fetch GC ConfigMap {} in cluster {}: {}",
+                           reconciliation, gcConfigMapName, clusterId, e.getMessage());
+            }
+            
+            if (gcConfigMap != null && gcConfigMap.getMetadata().getUid() != null) {
+                String gcUid = gcConfigMap.getMetadata().getUid();
+                
+                io.fabric8.kubernetes.api.model.OwnerReference gcOwner = 
+                    new io.fabric8.kubernetes.api.model.OwnerReferenceBuilder()
+                        .withApiVersion("v1")
+                        .withKind("ConfigMap")
+                        .withName(gcConfigMapName)
+                        .withUid(gcUid)
+                        .withController(false)
+                        .withBlockOwnerDeletion(false)
+                        .build();
+                
+                List<io.fabric8.kubernetes.api.model.OwnerReference> owners = new ArrayList<>();
+                owners.add(gcOwner);
+                serviceExport.getMetadata().setOwnerReferences(owners);
+                
+                LOGGER.debug("{}: Added GC ConfigMap {} (UID: {}) as owner for ServiceExport {} in cluster {}",
+                           reconciliation, gcConfigMapName, gcUid, serviceName, clusterId);
+            } else {
+                LOGGER.warn("{}: GC ConfigMap {} not found or has no UID in cluster {}, ServiceExport will not have owner reference",
+                           reconciliation, gcConfigMapName, clusterId);
+            }
+        }
+
         List<HasMetadata> resources = new ArrayList<>();
 
         // IMPORTANT: For central cluster, skip Service creation (Strimzi already creates it)
@@ -316,8 +383,7 @@ public final class McsNetworkingProvider
     public String generateServiceDnsName(final String namespace,
                                           final String serviceName,
                                           final String clusterId) {
-        // MCS format: <service>.<cluster-id>.<namespace>
-        // .svc.<clusterset-domain>
+        // MCS format: <service>.<cluster-id>.<namespace>.svc.<clusterset-domain>
         return String.format("%s.%s.%s.svc.%s",
             serviceName,
             clusterId,
@@ -330,8 +396,7 @@ public final class McsNetworkingProvider
                                       final String serviceName,
                                       final String podName,
                                       final String clusterId) {
-        // MCS format: <pod>.<cluster-id>.<service>.<namespace>
-        // .svc.<clusterset-domain>
+        // MCS format: <pod>.<cluster-id>.<service>.<namespace>.svc.<clusterset-domain>
         String dns = String.format("%s.%s.%s.%s.svc.%s",
             podName,
             clusterId,
@@ -371,8 +436,7 @@ public final class McsNetworkingProvider
                             "Port not found: " + portName));
 
                 // Generate MCS-compliant DNS name
-                // Format: <pod>.<cluster-id>.<service>.<namespace>
-                // .svc.<clusterset-domain>:<port>
+                // Format: <pod>.<cluster-id>.<service>.<namespace>.svc.<clusterset-domain>:<port>
                 String dnsName = String.format("%s.%s.%s.%s.svc.%s:%d",
                     podName,
                     clusterId,
@@ -408,11 +472,11 @@ public final class McsNetworkingProvider
 
         for (Map.Entry<String, String> entry
                 : listeners.entrySet()) {
-            String listenerName = entry.getKey();
-            String portName = entry.getValue();
+            String listenerName = entry.getKey(); // e.g., "REPLICATION-9091", "PLAIN-9092"
+            String portName = entry.getValue();   // e.g., "replication", "plain"
 
-            // Map port names to port numbers (standard Kafka ports)
-            int port = getStandardPort(portName);
+            // Extract port number from listener name (format: LISTENER_NAME-PORT)
+            int port = extractPortFromListenerName(listenerName);
 
             // Generate MCS DNS name
             String dnsName = String.format("%s.%s.%s.%s.svc.%s",
@@ -437,41 +501,41 @@ public final class McsNetworkingProvider
     }
 
     /**
-     * Get standard Kafka port number for a given port name.
-     * This should ideally come from the Kafka CR listener configuration.
+     * Extract port number from listener name.
+     * Listener names follow the format: LISTENER_NAME-PORT (e.g., "REPLICATION-9091", "PLAIN-9092").
+     * For internal ports (replication, control-plane), use standard ports if not specified.
      *
-     * @param portName Port name to map to port number
-     * @return Port number
+     * @param listenerName Listener name that may contain port number (e.g., "REPLICATION-9091")
+     * @return Port number extracted from listener name
+     * @throws IllegalArgumentException if port cannot be extracted
      */
-    private int getStandardPort(final String portName) {
-        switch (portName.toLowerCase(Locale.ROOT)) {
-            case "replication":
-                return PORT_REPLICATION;
-            case "plain":
-                return PORT_PLAIN;
-            case "tls":
-                return PORT_TLS;
-            case "external":
-                return PORT_EXTERNAL;
-            case "controlplane-9090":
-            case "control-plane":
-                return PORT_CONTROL_PLANE;
-            default:
-                // Try to extract port from name if it contains a number
+    private int extractPortFromListenerName(final String listenerName) {
+        // Try to extract port from listener name (format: LISTENER_NAME-PORT)
+        String[] parts = listenerName.split("-");
+        
+        // Check last part for port number
+        if (parts.length > 0) {
+            String lastPart = parts[parts.length - 1];
+            if (lastPart.matches("\\d+")) {
                 try {
-                    String[] parts = portName.split("-");
-                    for (String part : parts) {
-                        if (part.matches("\\d+")) {
-                            return Integer.parseInt(part);
-                        }
-                    }
+                    return Integer.parseInt(lastPart);
                 } catch (NumberFormatException e) {
-                    // Fall through to default
+                    // Fall through
                 }
-                LOGGER.warn("Unknown port name: {}, defaulting to {}",
-                        portName, PORT_PLAIN);
-                return PORT_PLAIN;
+            }
         }
+        
+        // Fallback for internal ports without explicit port in name
+        String lowerName = listenerName.toLowerCase(Locale.ROOT);
+        if (lowerName.contains("replication")) {
+            return PORT_REPLICATION;
+        } else if (lowerName.contains("control") || lowerName.contains("ctrlplane")) {
+            return PORT_CONTROL_PLANE;
+        }
+        
+        throw new IllegalArgumentException(
+            "Cannot extract port number from listener name: " + listenerName + 
+            ". Expected format: LISTENER_NAME-PORT (e.g., PLAIN-9092)");
     }
 
     @Override
@@ -486,7 +550,8 @@ public final class McsNetworkingProvider
         // .svc.<clusterset-domain>:<port>
 
         List<String> voters = new ArrayList<>();
-        int port = getStandardPort(replicationPortName);
+        // Replication port is always 9091 for internal Kafka communication
+        int port = PORT_REPLICATION;
 
         for (ControllerPodInfo controller : controllerPods) {
             String podName = controller.podName();
