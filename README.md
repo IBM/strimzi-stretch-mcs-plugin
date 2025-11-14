@@ -9,11 +9,43 @@ This plugin implements the `StretchNetworkingProvider` SPI to enable cross-clust
 - **Submariner** - Multi-cluster networking for Kubernetes
 - **Cilium Cluster Mesh** - eBPF-based multi-cluster networking
 
-## Requirements
+## Prerequisites
+
+### 1. Multi-Cluster Services (MCS) API (REQUIRED)
+
+**This plugin requires the Kubernetes Multi-Cluster Services (MCS) API to be installed in your clusters.**
+
+The ServiceExport CRD is NOT part of Strimzi or this plugin. It must be installed separately from the official MCS API repository.
+
+**Install MCS CRDs:**
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/mcs-api/releases/latest/download/mcs-api.yaml
+```
+
+**Verify installation:**
+
+```bash
+kubectl get crd serviceexports.multicluster.x-k8s.io
+kubectl get crd serviceimports.multicluster.x-k8s.io
+```
+
+**Official MCS API Repository:** https://github.com/kubernetes-sigs/mcs-api
+
+### 2. MCS Implementation (REQUIRED)
+
+You also need an MCS-compliant networking implementation such as:
+
+- **[Submariner](https://submariner.io/)** - Multi-cluster networking for Kubernetes
+- **[Cilium Cluster Mesh](https://docs.cilium.io/en/stable/network/clustermesh/)** - eBPF-based multi-cluster networking
+- Other MCS-compliant solutions
+
+Refer to your chosen implementation's documentation for installation instructions.
+
+### 3. Strimzi Cluster Operator
 
 - Strimzi Cluster Operator 0.48.0 (This will change for sure in future) or later
 - Kubernetes clusters with MCS API support
-- MCS implementation (Submariner, Cilium ...)
 
 ## Building
 
@@ -252,7 +284,23 @@ Expected output:
 ```
 INFO: Loading custom networking provider: io.strimzi.plugin.stretch.McsNetworkingProvider from /opt/strimzi/plugins/stretch-mcs/*
 INFO: Successfully loaded custom provider: mcs (io.strimzi.plugin.stretch.McsNetworkingProvider)
+INFO: ServiceExport CRD detected - MCS API is installed
+INFO: MCS provider initialized with clustersetDomain=clusterset.local, requireNamespaceSameness=true
 INFO: Provider 'mcs' initialized successfully
+```
+
+### MCS CRD Not Installed
+
+If you see this error:
+
+```
+ERROR: ServiceExport CRD is not installed. The MCS (Multi-Cluster Services) API must be installed separately. Please install from: https://github.com/kubernetes-sigs/mcs-api
+```
+
+This means the MCS API CRDs are not installed. Install them using:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/mcs-api/releases/latest/download/mcs-api.yaml
 ```
 
 ## Contributing
